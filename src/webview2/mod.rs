@@ -2024,20 +2024,32 @@ unsafe fn set_theme(webview: &ICoreWebView2, theme: Theme) -> Result<()> {
   }
 }
 
-const MAIN_FRAME_GUARD: &str = "if (window.top !== window) { addEventListener('error', function (e) { e.preventDefault() }, { once: true }); throw 0 }";
+/// `window.addEventListener`, not `addEventListener`: a top-level `let`, `const` or `class` named
+/// `addEventListener` in the script is declared (uninitialized) before the guard runs, so the bare
+/// name would throw a `ReferenceError` instead of reaching the listener. A top-level
+/// `function addEventListener` still replaces the property, so it cannot be guarded against here.
+const MAIN_FRAME_GUARD: &str = "if (window.top !== window) { window.addEventListener('error', function (e) { e.preventDefault() }, { once: true }); throw 0 }";
+
+/// The ECMAScript line terminators.
+const LINE_TERMINATORS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 
 /// Stops a script in subframes. WebView2 runs every `AddScriptToExecuteOnDocumentCreated` script
 /// in every frame and has no API to limit one to the main frame, so the script checks the frame
 /// itself before its first statement. Each such script is a separate script, so the throw ends only
 /// this one. Wrapping the script in a block instead would scope its top-level `let`, `const` and
 /// `class` to that block in the main frame too. The `error` listener cancels the error event, so
-/// the throw is not reported to the console. The guard goes after a leading directive prologue,
-/// since `"use strict"` is a directive only before the first other statement, and on the same line,
-/// so line numbers in stack traces stay the same.
+/// the throw is not reported to the console. The guard goes after a leading hashbang line, which
+/// is only valid at the very start, and after a leading directive prologue, since `"use strict"` is
+/// a directive only before the first other statement. It goes on a line of the script, so line
+/// numbers in stack traces stay the same.
+///
+/// A script that starts with the HTML-like comment `-->` is not supported: the guard would land
+/// before it, where it is no longer a comment.
 fn main_frame_only(script: &str) -> String {
-  let at = directive_prologue_end(script);
+  let start = hashbang_end(script);
+  let at = directive_prologue_end(script, start);
   // A directive that ends at a line break gets a `;`, so the guard cannot continue its line.
-  let semicolon = if at > 0 && !script[..at].ends_with(';') {
+  let semicolon = if at > start && !script[..at].ends_with(';') {
     ";"
   } else {
     ""
@@ -2049,13 +2061,32 @@ fn main_frame_only(script: &str) -> String {
   )
 }
 
+/// The byte offset after the first line terminator of a leading hashbang (`#!/usr/bin/env node`),
+/// or 0 when `script` has none.
+fn hashbang_end(script: &str) -> usize {
+  if !script.starts_with("#!") {
+    return 0;
+  }
+  match script.find(LINE_TERMINATORS) {
+    Some(i) => {
+      let rest = &script[i..];
+      i + if rest.starts_with("\r\n") {
+        2
+      } else {
+        rest.chars().next().map_or(1, char::len_utf8)
+      }
+    }
+    None => script.len(),
+  }
+}
+
 /// The byte offset after the last directive (`"use strict";`, `'use strict'` followed by a line
-/// break) at the start of `script`, or 0. A string that is not a whole statement, such as
-/// `"a" + b`, ends the prologue.
-fn directive_prologue_end(script: &str) -> usize {
+/// break) in the prologue that starts at `start`, or `start`. A string that is not a whole
+/// statement, such as `"a" + b`, ends the prologue.
+fn directive_prologue_end(script: &str, start: usize) -> usize {
   let bytes = script.as_bytes();
-  let mut end = 0;
-  let mut i = skip_trivia(script, 0).0;
+  let mut end = start;
+  let mut i = skip_trivia(script, start).0;
   while let Some(&quote @ (b'"' | b'\'')) = bytes.get(i) {
     let mut j = i + 1;
     loop {
@@ -2073,14 +2104,9 @@ fn directive_prologue_end(script: &str) -> usize {
         end = next + 1;
         i = skip_trivia(script, end).0;
       }
-      // After a line break, a statement that cannot continue the string starts: another
-      // directive, a block, or a word other than `in` and `instanceof`.
-      Some(&c)
-        if line_break
-          && (matches!(c, b'"' | b'\'' | b'{' | b'_' | b'$') || c.is_ascii_alphabetic())
-          && !starts_with_word(&script[next..], "in")
-          && !starts_with_word(&script[next..], "instanceof") =>
-      {
+      // After a line break, anything that cannot continue the string as an expression starts a
+      // new statement: another directive, a block, a word, a digit, `!`, `~`, `++`, `--`.
+      Some(_) if line_break && !continues_expression(&script[next..]) => {
         end = after;
         i = next;
       }
@@ -2092,7 +2118,7 @@ fn directive_prologue_end(script: &str) -> usize {
 }
 
 /// Skips whitespace and comments from `i`; returns the next offset and whether a line break was
-/// crossed.
+/// crossed. `<!--` anywhere and `-->` after a line break are comments too (Annex B).
 fn skip_trivia(script: &str, mut i: usize) -> (usize, bool) {
   let mut line_break = false;
   loop {
@@ -2102,19 +2128,38 @@ fn skip_trivia(script: &str, mut i: usize) -> (usize, bool) {
       .next()
       .filter(|c| c.is_whitespace() || *c == '\u{feff}')
     {
-      line_break |= matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
+      line_break |= LINE_TERMINATORS.contains(&c);
       i += c.len_utf8();
-    } else if rest.starts_with("//") {
-      i += rest.find(['\n', '\r']).unwrap_or(rest.len());
+    } else if rest.starts_with("//")
+      || rest.starts_with("<!--")
+      || (line_break && rest.starts_with("-->"))
+    {
+      i += rest.find(LINE_TERMINATORS).unwrap_or(rest.len());
     } else if let Some(body) = rest.strip_prefix("/*") {
       let Some(close) = body.find("*/") else {
         return (script.len(), line_break);
       };
-      line_break |= body[..close].contains(['\n', '\r']);
+      line_break |= body[..close].contains(LINE_TERMINATORS);
       i += close + 4;
     } else {
       return (i, line_break);
     }
+  }
+}
+
+/// Whether the token at the start of `rest`, after a line break, continues the expression before it
+/// instead of starting a new statement by automatic semicolon insertion. `++` and `--` do not
+/// continue it (restricted production), and `!` only does as `!=`.
+fn continues_expression(rest: &str) -> bool {
+  let mut chars = rest.chars();
+  match chars.next() {
+    Some('+') => chars.next() != Some('+'),
+    Some('-') => chars.next() != Some('-'),
+    Some('!') => chars.next() == Some('='),
+    Some(
+      '(' | '[' | '`' | '.' | '?' | '*' | '/' | '%' | '<' | '>' | '=' | '&' | '|' | '^' | ',',
+    ) => true,
+    _ => starts_with_word(rest, "in") || starts_with_word(rest, "instanceof"),
   }
 }
 
@@ -2184,5 +2229,68 @@ mod tests {
       );
     }
     assert_eq!(main_frame_only("'a\\'b';x"), format!("'a\\'b';{GUARD}x"));
+  }
+
+  #[test]
+  fn a_directive_stays_when_a_statement_starts_on_the_next_line() {
+    for script in [
+      "'use strict'\n!function(){x=1}()",
+      "'use strict'\n~x",
+      "'use strict'\n0, x=1",
+      "'use strict'\n\u{3c0}=1",
+      "'use strict'\n\\u0078=1",
+      "'use strict'\n++x",
+      "'use strict'\n--x",
+      "'use strict'\n<!-- c\nx=1",
+      "'use strict'\n--> c\nx=1",
+    ] {
+      let (directive, rest) = script.split_once('\n').unwrap();
+      assert_eq!(
+        main_frame_only(script),
+        format!("{directive};{GUARD}\n{rest}"),
+        "{script}"
+      );
+    }
+    for script in ["'use strict'\n!= x", "'use strict'\n-x", "'use strict'\n%x"] {
+      assert_eq!(
+        main_frame_only(script),
+        format!("{GUARD}{script}"),
+        "{script}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_comment_ends_at_every_line_terminator() {
+    // The `//` comment ends at U+2028, so `.trim()` continues `'a'` and it is not a directive.
+    let script = "'a' // c\u{2028}.trim(); x=1";
+    assert_eq!(main_frame_only(script), format!("{GUARD}{script}"));
+    // A block comment with U+2029 is a line break, so `x` starts a statement.
+    let script = "'use strict' /* c\u{2029}*/ x=1";
+    assert_eq!(
+      main_frame_only(script),
+      format!("'use strict';{GUARD} /* c\u{2029}*/ x=1")
+    );
+  }
+
+  #[test]
+  fn the_guard_goes_after_a_hashbang_line() {
+    assert_eq!(main_frame_only("#!/x\nx=1"), format!("#!/x\n{GUARD}x=1"));
+    assert_eq!(
+      main_frame_only("#!/x\r\n'use strict'\nx=1"),
+      format!("#!/x\r\n'use strict';{GUARD}\nx=1")
+    );
+    assert_eq!(main_frame_only(" #!/x\nx=1"), format!("{GUARD} #!/x\nx=1"));
+  }
+
+  #[test]
+  fn the_guard_calls_window_add_event_listener() {
+    // A top-level `const addEventListener` is in its temporal dead zone when the guard runs, so a
+    // bare call would throw a `ReferenceError` there instead of cancelling the error event.
+    assert_eq!(
+      GUARD.matches("addEventListener(").count(),
+      GUARD.matches("window.addEventListener(").count()
+    );
+    assert!(GUARD.contains("window.addEventListener("));
   }
 }
