@@ -1026,7 +1026,9 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **Windows:** scripts are always added to subframes regardless of the `for_main_frame_only` option.
+  /// - **Windows:** WebView2 adds every script to subframes too, so a script with `for_main_frame_only`
+  ///   set is wrapped in `if (window.top === window) { ... }`. Its top-level `let`, `const` and
+  ///   `class` declarations are then scoped to that block.
   /// - **Android**: When [addDocumentStartJavaScript] is not supported, scripts are always injected into main frame only.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
@@ -2615,8 +2617,10 @@ pub struct InitializationScript {
   ///
   /// ## Platform-specific
   ///
-  /// - **Windows**: scripts are always injected into subframes regardless of this option.
-  ///   This will be the case until Webview2 implements a proper API to inject a script only on the main frame.
+  /// - **Windows**: WebView2 injects every script into subframes too and has no API to inject one
+  ///   into the main frame only, so a main-frame-only script is wrapped in
+  ///   `if (window.top === window) { ... }`. Its top-level `let`, `const` and `class` declarations
+  ///   are then scoped to that block.
   /// - **Android**: When [addDocumentStartJavaScript] is not supported, scripts are always injected into main frame only.
   ///
   /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)

@@ -514,7 +514,12 @@ impl InnerWebView {
 
     // Initialize main and subframe scripts
     for init_script in attributes.initialization_scripts {
-      Self::add_script_to_execute_on_document_created(&webview, init_script.script)?;
+      let script = if init_script.for_main_frame_only {
+        top_frame_only(&init_script.script)
+      } else {
+        init_script.script
+      };
+      Self::add_script_to_execute_on_document_created(&webview, script)?;
     }
 
     // Enable clipboard
@@ -2018,6 +2023,15 @@ unsafe fn set_theme(webview: &ICoreWebView2, theme: Theme) -> Result<()> {
   }
 }
 
+/// WebView2 runs every `AddScriptToExecuteOnDocumentCreated` script in every frame and has no API
+/// to limit one to the main frame, so a main-frame-only script checks the frame itself. Scripts
+/// run before any page script, so a subframe cannot change `window.top` first. The block scopes the
+/// script's top-level `let`, `const` and `class`, and the newline keeps a trailing `//` comment
+/// from swallowing the closing brace.
+fn top_frame_only(script: &str) -> String {
+  format!("if (window.top === window) {{\n{script}\n}}")
+}
+
 pub fn platform_webview_version() -> Result<String> {
   let mut versioninfo = PWSTR::null();
   unsafe { GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut versioninfo) }?;
@@ -2029,4 +2043,17 @@ fn is_windows_7() -> bool {
   let v = windows_version::OsVersion::current();
   // windows 7 is 6.1
   v.major == 6 && v.minor == 1
+}
+
+#[cfg(test)]
+mod tests {
+  use super::top_frame_only;
+
+  #[test]
+  fn a_main_frame_only_script_is_guarded_by_the_frame_check() {
+    assert_eq!(
+      top_frame_only("window.x = 1; // done"),
+      "if (window.top === window) {\nwindow.x = 1; // done\n}"
+    );
+  }
 }
