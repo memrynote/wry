@@ -515,7 +515,12 @@ impl InnerWebView {
 
     // Initialize main and subframe scripts
     for init_script in attributes.initialization_scripts {
-      Self::add_script_to_execute_on_document_created(&webview, init_script.script)?;
+      let script = if init_script.for_main_frame_only {
+        main_frame_only(&init_script.script)
+      } else {
+        init_script.script
+      };
+      Self::add_script_to_execute_on_document_created(&webview, script)?;
     }
 
     // Enable clipboard
@@ -2019,6 +2024,105 @@ unsafe fn set_theme(webview: &ICoreWebView2, theme: Theme) -> Result<()> {
   }
 }
 
+const MAIN_FRAME_GUARD: &str = "if (window.top !== window) { addEventListener('error', function (e) { e.preventDefault() }, { once: true }); throw 0 }";
+
+/// Stops a script in subframes. WebView2 runs every `AddScriptToExecuteOnDocumentCreated` script
+/// in every frame and has no API to limit one to the main frame, so the script checks the frame
+/// itself before its first statement. Each such script is a separate script, so the throw ends only
+/// this one. Wrapping the script in a block instead would scope its top-level `let`, `const` and
+/// `class` to that block in the main frame too. The `error` listener cancels the error event, so
+/// the throw is not reported to the console. The guard goes after a leading directive prologue,
+/// since `"use strict"` is a directive only before the first other statement, and on the same line,
+/// so line numbers in stack traces stay the same.
+fn main_frame_only(script: &str) -> String {
+  let at = directive_prologue_end(script);
+  // A directive that ends at a line break gets a `;`, so the guard cannot continue its line.
+  let semicolon = if at > 0 && !script[..at].ends_with(';') {
+    ";"
+  } else {
+    ""
+  };
+  format!(
+    "{}{semicolon}{MAIN_FRAME_GUARD}{}",
+    &script[..at],
+    &script[at..]
+  )
+}
+
+/// The byte offset after the last directive (`"use strict";`, `'use strict'` followed by a line
+/// break) at the start of `script`, or 0. A string that is not a whole statement, such as
+/// `"a" + b`, ends the prologue.
+fn directive_prologue_end(script: &str) -> usize {
+  let bytes = script.as_bytes();
+  let mut end = 0;
+  let mut i = skip_trivia(script, 0).0;
+  while let Some(&quote @ (b'"' | b'\'')) = bytes.get(i) {
+    let mut j = i + 1;
+    loop {
+      match bytes.get(j) {
+        Some(&c) if c == quote => break,
+        Some(b'\\') => j += 2,
+        Some(b'\n' | b'\r') | None => return end,
+        Some(_) => j += 1,
+      }
+    }
+    let after = j + 1;
+    let (next, line_break) = skip_trivia(script, after);
+    match bytes.get(next) {
+      Some(b';') => {
+        end = next + 1;
+        i = skip_trivia(script, end).0;
+      }
+      // After a line break, a statement that cannot continue the string starts: another
+      // directive, a block, or a word other than `in` and `instanceof`.
+      Some(&c)
+        if line_break
+          && (matches!(c, b'"' | b'\'' | b'{' | b'_' | b'$') || c.is_ascii_alphabetic())
+          && !starts_with_word(&script[next..], "in")
+          && !starts_with_word(&script[next..], "instanceof") =>
+      {
+        end = after;
+        i = next;
+      }
+      None => return after,
+      _ => return end,
+    }
+  }
+  end
+}
+
+/// Skips whitespace and comments from `i`; returns the next offset and whether a line break was
+/// crossed.
+fn skip_trivia(script: &str, mut i: usize) -> (usize, bool) {
+  let mut line_break = false;
+  loop {
+    let rest = &script[i..];
+    if let Some(c) = rest
+      .chars()
+      .next()
+      .filter(|c| c.is_whitespace() || *c == '\u{feff}')
+    {
+      line_break |= matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
+      i += c.len_utf8();
+    } else if rest.starts_with("//") {
+      i += rest.find(['\n', '\r']).unwrap_or(rest.len());
+    } else if let Some(body) = rest.strip_prefix("/*") {
+      let Some(close) = body.find("*/") else {
+        return (script.len(), line_break);
+      };
+      line_break |= body[..close].contains(['\n', '\r']);
+      i += close + 4;
+    } else {
+      return (i, line_break);
+    }
+  }
+}
+
+fn starts_with_word(s: &str, word: &str) -> bool {
+  s.strip_prefix(word)
+    .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$'))
+}
+
 pub fn platform_webview_version() -> Result<String> {
   let mut versioninfo = PWSTR::null();
   unsafe { GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut versioninfo) }?;
@@ -2030,4 +2134,55 @@ fn is_windows_7() -> bool {
   let v = windows_version::OsVersion::current();
   // windows 7 is 6.1
   v.major == 6 && v.minor == 1
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{MAIN_FRAME_GUARD as GUARD, main_frame_only};
+
+  #[test]
+  fn the_guard_runs_before_the_script_on_its_first_line() {
+    assert_eq!(
+      main_frame_only("const a = 1;\nwindow.x = a; // done"),
+      format!("{GUARD}const a = 1;\nwindow.x = a; // done")
+    );
+  }
+
+  #[test]
+  fn the_guard_goes_after_a_leading_directive_prologue() {
+    assert_eq!(
+      main_frame_only("\"use strict\"; let a = 1;"),
+      format!("\"use strict\";{GUARD} let a = 1;")
+    );
+    assert_eq!(
+      main_frame_only("// header\n'use strict';\n\"x\" ;\nlet a;"),
+      format!("// header\n'use strict';\n\"x\" ;{GUARD}\nlet a;")
+    );
+    assert_eq!(
+      main_frame_only("'use strict'\nlet a;"),
+      format!("'use strict';{GUARD}\nlet a;")
+    );
+    assert_eq!(
+      main_frame_only("  'use strict'"),
+      format!("  'use strict';{GUARD}")
+    );
+  }
+
+  #[test]
+  fn a_string_that_is_not_a_whole_statement_is_not_a_directive() {
+    for script in [
+      "'use strict' + x;",
+      "'use strict'\n+ x;",
+      "'use strict'\n.length;",
+      "'use strict'\ninstanceof X;",
+      "'unterminated\n';",
+    ] {
+      assert_eq!(
+        main_frame_only(script),
+        format!("{GUARD}{script}"),
+        "{script}"
+      );
+    }
+    assert_eq!(main_frame_only("'a\\'b';x"), format!("'a\\'b';{GUARD}x"));
+  }
 }
